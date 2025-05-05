@@ -1,176 +1,192 @@
 """
-Warehouse Location Optimizer (Streamlit app)
-Upload a CSV/XLSX file with columns: lat, lon, sales.
-Select the number of warehouses to optimize for and visualize the result.
+Warehouse Location Optimizer – Streamlit (no external ML deps)
+=============================================================
+Upload a CSV / Excel file with **Latitude**, **Longitude**, **Sales** columns (camel‑case like the
+helper template). Choose how many warehouses you want, and the app assigns each
+store to the nearest centroid found via a lightweight weighted K‑Means written
+from scratch – so **no scikit‑learn** is required. All visualisations are built
+with Altair for a zero‑compile install on Streamlit Cloud.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.cluster import KMeans
 import altair as alt
-import folium
-from streamlit_folium import st_folium
+import base64
+from typing import Tuple
 
-st.set_page_config(page_title="Warehouse Location Optimizer", layout="wide")
+# ──────────────────────────────  Page setup  ──────────────────────────────
+st.set_page_config(page_title="Warehouse Optimizer", page_icon="🏭", layout="wide")
+st.title("Warehouse Location Optimizer")
+st.markdown("""
+Upload your store list, pick the number of warehouses, and instantly see the
+optimal locations along with distance & sales metrics. 100‑store synth sample
+included for quick testing.
+""")
 
-# -----------------------------------------------------------------------------
-# Sidebar – controls
-# -----------------------------------------------------------------------------
-with st.sidebar:
-    st.header("1️⃣  Upload Your Store Data")
-    uploaded_file = st.file_uploader(
-        "CSV or Excel with columns: lat, lon, sales", type=["csv", "xlsx"]
+# ─────────────────────  Helper functions & core logic  ────────────────────
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Vectorised haversine (returns km). Accepts NumPy arrays."""
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return 6371.0 * c
+
+
+def generate_sample_data(n: int = 100) -> pd.DataFrame:
+    """Return a reproducible 100‑store dataset across the contiguous U.S."""
+    rng = np.random.default_rng(42)
+    lats = rng.uniform(25, 49, n)
+    lons = rng.uniform(-124, -66, n)
+    sales = rng.integers(10_000, 1_000_000, n)
+    return pd.DataFrame({"Latitude": lats, "Longitude": lons, "Sales": sales})
+
+
+def custom_kmeans(X: np.ndarray, k: int, weights: np.ndarray | None = None, max_iter: int = 100) -> Tuple[np.ndarray, np.ndarray]:
+    """Simple weighted K‑Means (Euclidean) – returns (centroids, labels)."""
+    n = X.shape[0]
+    if weights is not None:
+        # Sample initial centroids proportional to sales so big stores influence seeding
+        weights_p = weights / weights.sum()
+        centroids = X[np.random.choice(n, k, replace=False, p=weights_p)]
+    else:
+        centroids = X[np.random.choice(n, k, replace=False)]
+
+    labels = np.full(n, -1)
+    for _ in range(max_iter):
+        # Assign step
+        dists = np.linalg.norm(X[:, None, :] - centroids[None, :, :], axis=2)
+        new_labels = dists.argmin(axis=1)
+        if np.array_equal(labels, new_labels):
+            break
+        labels = new_labels
+        # Update step
+        for i in range(k):
+            mask = labels == i
+            if mask.any():
+                if weights is None:
+                    centroids[i] = X[mask].mean(axis=0)
+                else:
+                    w = weights[mask]
+                    centroids[i] = (X[mask] * w[:, None]).sum(axis=0) / w.sum()
+    return centroids, labels
+
+
+def optimise_network(df: pd.DataFrame, k: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Cluster stores, compute distances & per‑warehouse metrics."""
+    X = df[["Latitude", "Longitude"]].to_numpy()
+    sales = df["Sales"].to_numpy()
+    cents, labels = custom_kmeans(X, k, weights=sales)
+    df = df.copy()
+    df["Warehouse"] = labels
+    # Distances in km to assigned centroid
+    cents_lat = cents[labels, 0]
+    cents_lon = cents[labels, 1]
+    df["Distance_km"] = haversine_distance(df["Latitude"].values, df["Longitude"].values, cents_lat, cents_lon)
+    # Centroids DF
+    wh = pd.DataFrame(cents, columns=["Latitude", "Longitude"])
+    wh["Warehouse"] = wh.index
+    # Metrics
+    metrics = (
+        df.groupby("Warehouse")
+        .agg(Stores=("Warehouse", "size"), Sales=("Sales", "sum"), Avg_Dist_km=("Distance_km", "mean"))
+        .reset_index()
+        .merge(wh, on="Warehouse")
     )
-    use_sample = st.checkbox("Use built‑in sample dataset (100 stores)")
+    return df, metrics
 
-    st.header("2️⃣  Choose Number of Warehouses")
-    n_clusters = st.slider(
-        "Warehouses to solve for", min_value=1, max_value=10, value=3
-    )
 
-    st.markdown("---")
-    st.caption(
-        "Tip: pinning dependency versions in **requirements.txt** avoids Streamlit Cloud build issues."
-    )
+def df_download_link(df: pd.DataFrame, filename: str, text: str) -> str:
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    return f'<a href="data:file/csv;base64,{b64}" download="{filename}">{text}</a>'
 
-# -----------------------------------------------------------------------------
-# Data ingestion & validation
-# -----------------------------------------------------------------------------
-
-def load_data(file) -> pd.DataFrame:
-    if file.name.endswith(".csv"):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
-
-required_cols = {"lat", "lon", "sales"}
+# ───────────────────────────────  Sidebar  ────────────────────────────────
+sidebar = st.sidebar
+sidebar.header("Configuration")
+use_sample = sidebar.checkbox("Use sample 100‑store dataset", value=True)
 
 if use_sample:
-    # Generate a reproducible synthetic dataset (100 stores across contiguous U.S.)
-    rng = np.random.default_rng(42)
-    lats = rng.uniform(25, 49, 100)
-    lons = rng.uniform(-124, -66, 100)
-    sales = rng.integers(10_000, 1_000_000, 100)
-    stores_df = pd.DataFrame({"lat": lats, "lon": lons, "sales": sales})
-elif uploaded_file is not None:
-    stores_df = load_data(uploaded_file)
+    stores_df = generate_sample_data()
 else:
-    st.info("⬅️ Upload a dataset or select the sample option to begin.")
+    uploaded = sidebar.file_uploader("Upload CSV / XLSX", type=["csv", "xlsx"])
+    if uploaded is None:
+        sidebar.info("Awaiting file...")
+        st.stop()
+    if uploaded.name.endswith(".csv"):
+        stores_df = pd.read_csv(uploaded)
+    else:
+        stores_df = pd.read_excel(uploaded)
+
+required = {"Latitude", "Longitude", "Sales"}
+if not required.issubset(stores_df.columns):
+    st.error(f"File must contain columns: {', '.join(required)}")
     st.stop()
 
-if not required_cols.issubset(stores_df.columns):
-    st.error(f"Data file must contain columns: {', '.join(required_cols)}")
-    st.stop()
+k = sidebar.slider("Warehouses to optimise", 1, 10, 3)
 
-# -----------------------------------------------------------------------------
-# Weighted K‑Means clustering (sales as weights)
-# -----------------------------------------------------------------------------
-coords = stores_df[["lat", "lon"]].to_numpy()
-weights = stores_df["sales"].to_numpy()
+# ─────────────────────────────  Main results  ─────────────────────────────
+stores_df, metrics_df = optimise_network(stores_df, k)
 
-kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
-kmeans.fit(coords, sample_weight=weights)
+# Tabs for UX
+map_tab, metrics_tab, download_tab = st.tabs(["🗺 Map", "📊 Metrics", "⬇️ Downloads"])
 
-stores_df["warehouse_id"] = kmeans.predict(coords)
-centroids = kmeans.cluster_centers_
-warehouses_df = (
-    pd.DataFrame(centroids, columns=["lat", "lon"]).assign(warehouse_id=lambda d: d.index)
-)
-
-# -----------------------------------------------------------------------------
-# Distance calculation (vectorized Haversine) – result in miles
-# -----------------------------------------------------------------------------
-R = 3958.8  # Earth radius in miles
-lat1 = np.radians(stores_df["lat"].values)
-lon1 = np.radians(stores_df["lon"].values)
-lat2 = np.radians(centroids[stores_df["warehouse_id"], 0])
-lon2 = np.radians(centroids[stores_df["warehouse_id"], 1])
-
-dlat = lat2 - lat1
-dlon = lon2 - lon1
-a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-stores_df["distance_mi"] = R * 2 * np.arcsin(np.sqrt(a))
-
-# -----------------------------------------------------------------------------
-# Summary metrics per warehouse
-# -----------------------------------------------------------------------------
-summary_df = (
-    stores_df.groupby("warehouse_id").agg(
-        num_stores=("warehouse_id", "size"),
-        total_sales=("sales", "sum"),
-        avg_distance_mi=("distance_mi", "mean"),
+with map_tab:
+    st.subheader("Store & Warehouse Locations (Albers USA)")
+    # Stores layer
+    store_layer = (
+        alt.Chart(stores_df)
+        .mark_circle()
+        .encode(
+            longitude="Longitude:Q",
+            latitude="Latitude:Q",
+            size=alt.Size("Sales:Q", scale=alt.Scale(range=[30, 600]), title="Sales"),
+            color=alt.Color("Warehouse:N", legend=None),
+            tooltip=["Sales", "Distance_km"]
+        )
     )
-    .reset_index()
-    .merge(warehouses_df, on="warehouse_id")
-)
-
-# -----------------------------------------------------------------------------
-# Map visualisation (Folium rendered via streamlit‑folium)
-# -----------------------------------------------------------------------------
-map_center = [stores_df["lat"].mean(), stores_df["lon"].mean()]
-folium_map = folium.Map(location=map_center, zoom_start=5, control_scale=True)
-
-# Stores – tiny circle markers
-for _, row in stores_df.iterrows():
-    folium.CircleMarker(
-        location=[row.lat, row.lon],
-        radius=3,
-        weight=0,
-        fill=True,
-        fill_opacity=0.6,
-        popup=f"Sales: {row.sales:,.0f} USD",
-    ).add_to(folium_map)
-
-# Warehouses – pin icons
-for _, row in warehouses_df.iterrows():
-    folium.Marker(
-        location=[row.lat, row.lon],
-        icon=folium.Icon(color="red", icon="home", prefix="fa"),
-        popup=f"Warehouse {row.warehouse_id}",
-    ).add_to(folium_map)
-
-st.subheader("Network Map")
-st_folium(folium_map, height=600, use_container_width=True)
-
-# -----------------------------------------------------------------------------
-# Charts & tables
-# -----------------------------------------------------------------------------
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.subheader("Stores per Warehouse")
-    bar = (
-        alt.Chart(summary_df)
-        .mark_bar()
-        .encode(x="warehouse_id:N", y="num_stores:Q", tooltip=["num_stores", "total_sales"])
+    # Warehouse layer – white‑border squares
+    wh_layer = (
+        alt.Chart(metrics_df)
+        .mark_square(size=200, stroke="white", strokeWidth=2)
+        .encode(
+            longitude="Longitude:Q",
+            latitude="Latitude:Q",
+            color=alt.Color("Warehouse:N", legend=None),
+            tooltip=["Warehouse", "Stores", "Avg_Dist_km"]
+        )
     )
-    st.altair_chart(bar, use_container_width=True)
+    chart = (store_layer + wh_layer).properties(width=900, height=550).project(type="albersUsa")
+    st.altair_chart(chart, use_container_width=True)
 
-with col2:
-    st.subheader("Key Metrics")
-    st.dataframe(
-        summary_df.rename(
-            columns={
-                "warehouse_id": "Warehouse",
-                "num_stores": "Stores",
-                "total_sales": "Total Sales",
-                "avg_distance_mi": "Avg Dist (mi)",
-            }
-        ),
-        hide_index=True,
-    )
+with metrics_tab:
+    st.subheader("Key metrics per warehouse")
+    pretty = metrics_df.copy()
+    pretty["Sales"] = pretty["Sales"].apply(lambda x: f"${x:,.0f}")
+    pretty["Avg_Dist_km"] = pretty["Avg_Dist_km"].round(2)
+    st.dataframe(pretty, hide_index=True)
 
-# -----------------------------------------------------------------------------
-# Download buttons
-# -----------------------------------------------------------------------------
-@st.cache_data
-def to_csv(df):
-    return df.to_csv(index=False).encode("utf‑8")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Stores per warehouse**")
+        st.altair_chart(
+            alt.Chart(metrics_df).mark_bar().encode(x="Warehouse:N", y="Stores:Q", color="Warehouse:N"),
+            use_container_width=True,
+        )
+    with col2:
+        st.markdown("**Total sales per warehouse**")
+        st.altair_chart(
+            alt.Chart(metrics_df).mark_bar().encode(x="Warehouse:N", y="Sales:Q", color="Warehouse:N"),
+            use_container_width=True,
+        )
 
-st.download_button(
-    "Download Store Assignments (CSV)", to_csv(stores_df), "store_assignments.csv", "text/csv"
-)
+with download_tab:
+    st.subheader("Download CSVs")
+    st.markdown(df_download_link(stores_df, "store_assignments.csv", "Store assignments"), unsafe_allow_html=True)
+    st.markdown(df_download_link(metrics_df, "warehouse_metrics.csv", "Warehouse metrics"), unsafe_allow_html=True)
 
-st.download_button(
-    "Download Warehouse Summary (CSV)", to_csv(summary_df), "warehouse_summary.csv", "text/csv"
-)
+# ───────────────────────────  Footer tip  ────────────────────────────────
+st.caption("No external ML libraries – deployment‑friendly on Streamlit Cloud ✨")
